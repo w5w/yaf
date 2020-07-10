@@ -14,7 +14,6 @@
   +----------------------------------------------------------------------+
 */
 
-
 #ifndef YAF_VIEW_SIMPLE_H
 #define YAF_VIEW_SIMPLE_H
 
@@ -22,6 +21,9 @@
 #define VIEW_BUFFER_SIZE_MASK 	4095
 
 extern zend_class_entry *yaf_view_simple_ce;
+
+void yaf_view_simple_instance(yaf_view_t *view, zend_string *tpl_dir);
+int yaf_view_simple_render(yaf_view_t *view, zend_string *tpl, zval *vars, zval *ret);
 
 YAF_STARTUP_FUNCTION(view_simple);
 

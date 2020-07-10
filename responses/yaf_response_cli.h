@@ -14,7 +14,6 @@
   +----------------------------------------------------------------------+
 */
 
-
 #ifndef PHP_YAF_RESPONSE_CLI_H
 #define PHP_YAF_RESPONSE_CLI_H
 

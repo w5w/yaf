@@ -1,9 +1,12 @@
 --TEST--
 Check for Yaf_Session
 --SKIPIF--
-<?php if (!extension_loaded("yaf")) print "skip"; ?>
+<?php if (!extension_loaded("session")) die("skip session required"); ?>
+<?php if (!extension_loaded("yaf")) die("skip"); ?>
 --INI--
 yaf.use_namespace=0
+session.save_handler=files
+session.save_path=
 --FILE--
 <?php 
 $session = Yaf_Session::getInstance();

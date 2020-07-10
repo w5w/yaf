@@ -14,12 +14,13 @@
   +----------------------------------------------------------------------+
 */
 
-
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
 #include "php.h"
+#include "Zend/zend_smart_str.h" /* for smart_str */
+#include "Zend/zend_interfaces.h" /* for zend_class_serialize_deny */
 
 #include "php_yaf.h"
 #include "yaf_namespace.h"
@@ -30,9 +31,9 @@
 #include "routes/yaf_route_interface.h"
 #include "routes/yaf_route_static.h" /* for yaf_route_pathinfo_route */
 #include "routes/yaf_route_supervar.h"
-#include "ext/standard/php_smart_str.h" /* for smart_str */
 
 zend_class_entry *yaf_route_supervar_ce;
+static zend_object_handlers yaf_route_supervar_obj_handlers;
 
 /** {{{ ARG_INFO
  */
@@ -41,46 +42,138 @@ ZEND_BEGIN_ARG_INFO_EX(yaf_route_supervar_construct_arginfo, 0, 0, 1)
 ZEND_END_ARG_INFO()
 /* }}} */
 
-/** {{{ int yaf_route_supervar_route(yaf_route_t *route, yaf_request_t *request TSRMLS_DC)
- */
-int yaf_route_supervar_route(yaf_route_t *route, yaf_request_t *request TSRMLS_DC) {
-	zval *varname, *zuri;
-	char *req_uri;
+static HashTable *yaf_route_supervar_get_properties(zval *object) /* {{{ */ {
+	zval rv;
+	yaf_route_supervar_object *super = Z_YAFROUTESUPEROBJ_P(object);
 
-	varname = zend_read_property(yaf_route_supervar_ce, route, ZEND_STRL(YAF_ROUTE_SUPERVAR_PROPETY_NAME_VAR), 1 TSRMLS_CC);
+	if (!super->properties) {
+		ALLOC_HASHTABLE(super->properties);
+		zend_hash_init(super->properties, 2, NULL, ZVAL_PTR_DTOR, 0);
 
-	zuri = yaf_request_query(YAF_GLOBAL_VARS_GET, Z_STRVAL_P(varname), Z_STRLEN_P(varname) TSRMLS_CC);
+		ZVAL_STR_COPY(&rv, super->varname);
+		zend_hash_str_add(super->properties, "varname:protected", sizeof("varname:protected") - 1, &rv);
+	}
 
-	if (!zuri || ZVAL_IS_NULL(zuri)) {
+	return super->properties;
+}
+/* }}} */
+
+static zend_object *yaf_route_supervar_new(zend_class_entry *ce) /* {{{ */ {
+	yaf_route_supervar_object *supervar = emalloc(sizeof(yaf_route_supervar_object));
+
+	zend_object_std_init(&supervar->std, ce);
+
+	supervar->std.handlers = &yaf_route_supervar_obj_handlers;
+
+	supervar->varname = NULL;
+	supervar->properties = NULL;
+
+	return &supervar->std;
+}
+/* }}} */
+
+static void yaf_route_supervar_object_free(zend_object *object) /* {{{ */ {
+	yaf_route_supervar_object *supervar = (yaf_route_supervar_object*)object;
+
+	zend_string_release(supervar->varname);
+
+	if (supervar->properties) {
+		if (GC_DELREF(supervar->properties) == 0) {
+			GC_REMOVE_FROM_BUFFER(supervar->properties);
+			zend_array_destroy(supervar->properties);
+		}
+	}
+
+	zend_object_std_dtor(&supervar->std);
+}
+/* }}} */
+
+int yaf_route_supervar_route(yaf_route_t *route, yaf_request_t *req) /* {{{ */ {
+	zval *uri;
+	yaf_route_supervar_object *super = Z_YAFROUTESUPEROBJ_P(route);
+
+	uri = yaf_request_query(YAF_GLOBAL_VARS_GET, super->varname);
+
+	if (UNEXPECTED(uri == NULL)) {
 		return 0;
 	}
 
-	req_uri = estrndup(Z_STRVAL_P(zuri), Z_STRLEN_P(zuri));
-	yaf_route_pathinfo_route(request, req_uri, Z_STRLEN_P(zuri) TSRMLS_CC);
-	efree(req_uri);
+	yaf_route_pathinfo_route(Z_YAFREQUESTOBJ_P(req), Z_STRVAL_P(uri), Z_STRLEN_P(uri));
+
 	return 1;
 }
 /* }}} */
 
-/** {{{ yaf_route_t * yaf_route_supervar_instance(yaf_route_t *this_ptr, zval *name TSRMLS_DC)
- */
-yaf_route_t * yaf_route_supervar_instance(yaf_route_t *this_ptr, zval *name TSRMLS_DC) {
-	yaf_route_t *instance;
+static void yaf_route_supervar_init(yaf_route_supervar_object *super, zend_string *varname) /* {{{ */ {
+	super->varname = zend_string_copy(varname);
+}
+/* }}} */
 
-	if (!name || IS_STRING != Z_TYPE_P(name) || !Z_STRLEN_P(name)) {
+void yaf_route_supervar_instance(yaf_route_t *route, zend_string *varname) /* {{{ */ {
+	zend_object *router = yaf_route_supervar_new(yaf_route_supervar_ce);
+
+	yaf_route_supervar_init((yaf_route_supervar_object*)router, varname);
+
+	ZVAL_OBJ(route, router);
+}
+/* }}} */
+
+zend_string * yaf_route_supervar_assemble(yaf_route_supervar_object *super, zval *info, zval *query) /* {{{ */ {
+	zval *zv;
+	smart_str uri = {0};
+	zend_string *val;
+
+
+	smart_str_appendc(&uri, '?');
+	smart_str_appendl(&uri, ZSTR_VAL(super->varname), ZSTR_LEN(super->varname));
+	smart_str_appendc(&uri, '=');
+
+	if ((zv = zend_hash_str_find(Z_ARRVAL_P(info), ZEND_STRL(YAF_ROUTE_ASSEMBLE_MOUDLE_FORMAT))) != NULL) {
+		val = zval_get_string(zv);
+		smart_str_appendc(&uri, '/');
+		smart_str_appendl(&uri, ZSTR_VAL(val), ZSTR_LEN(val));
+		zend_string_release(val);
+	}
+
+	if ((zv = zend_hash_str_find(Z_ARRVAL_P(info), ZEND_STRL(YAF_ROUTE_ASSEMBLE_CONTROLLER_FORMAT))) == NULL) {
+		yaf_trigger_error(YAF_ERR_TYPE_ERROR, "%s", "You need to specify the controller by ':c'");
+		smart_str_free(&uri);
 		return NULL;
 	}
 
-	if (this_ptr) {
-		instance  = this_ptr;
-	} else {
-		MAKE_STD_ZVAL(instance);
-		object_init_ex(instance, yaf_route_supervar_ce);
+	val = zval_get_string(zv);
+	smart_str_appendc(&uri, '/');
+	smart_str_appendl(&uri, ZSTR_VAL(val), ZSTR_LEN(val));
+	zend_string_release(val);
+
+	if ((zv = zend_hash_str_find(Z_ARRVAL_P(info), ZEND_STRL(YAF_ROUTE_ASSEMBLE_ACTION_FORMAT))) == NULL) {
+		yaf_trigger_error(YAF_ERR_TYPE_ERROR, "%s", "You need to specify the action by ':a'");
+		smart_str_free(&uri);
+		return NULL;
 	}
 
-	zend_update_property(yaf_route_supervar_ce, instance, ZEND_STRL(YAF_ROUTE_SUPERVAR_PROPETY_NAME_VAR), name TSRMLS_CC);
+	val = zval_get_string(zv);
+	smart_str_appendc(&uri, '/');
+	smart_str_appendl(&uri, ZSTR_VAL(val), ZSTR_LEN(val));
+	zend_string_release(val);
 
-	return instance;
+	if (query && IS_ARRAY == Z_TYPE_P(query)) {
+		zend_string *key;
+
+		ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(query), key, zv) {
+			if (key) {
+				val = zval_get_string(zv);
+				smart_str_appendc(&uri, '&');
+				smart_str_appendl(&uri, ZSTR_VAL(key), ZSTR_LEN(key));
+				smart_str_appendc(&uri, '=');
+				smart_str_appendl(&uri, ZSTR_VAL(val), ZSTR_LEN(val));
+				zend_string_release(val);
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+
+	smart_str_0(&uri);
+	return uri.s;
 }
 /* }}} */
 
@@ -89,118 +182,39 @@ yaf_route_t * yaf_route_supervar_instance(yaf_route_t *this_ptr, zval *name TSRM
 PHP_METHOD(yaf_route_supervar, route) {
 	yaf_request_t *request;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "O", &request, yaf_request_ce) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "O", &request, yaf_request_ce) == FAILURE) {
 		return;
-	} else {
-		RETURN_BOOL(yaf_route_supervar_route(getThis(), request TSRMLS_CC));
 	}
+	RETURN_BOOL(yaf_route_supervar_route(getThis(), request));
 }
 /** }}} */
-
-/** {{{ zval * yaf_route_supervar_assemble(zval *info, zval *query TSRMLS_DC)
- */
-zval * yaf_route_supervar_assemble(yaf_route_t *this_ptr, zval *info, zval *query TSRMLS_DC) {
-	smart_str tvalue = {0};
-	zval *pname;
-	zval *uri;
-
-	MAKE_STD_ZVAL(uri);
-
-	pname = zend_read_property(yaf_route_supervar_ce, this_ptr, ZEND_STRL(YAF_ROUTE_SUPERVAR_PROPETY_NAME_VAR), 1 TSRMLS_CC);
-
-	do {
-		zval **tmp;
-	
-		smart_str_appendc(&tvalue, '?');
-		smart_str_appendl(&tvalue, Z_STRVAL_P(pname), Z_STRLEN_P(pname));
-		smart_str_appendc(&tvalue, '=');
-
-		if (zend_hash_find(Z_ARRVAL_P(info), ZEND_STRS(YAF_ROUTE_ASSEMBLE_MOUDLE_FORMAT), (void **)&tmp) == SUCCESS) {
-			smart_str_appendc(&tvalue, '/');
-			smart_str_appendl(&tvalue, Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-		}
-
-		if (zend_hash_find(Z_ARRVAL_P(info), ZEND_STRS(YAF_ROUTE_ASSEMBLE_CONTROLLER_FORMAT), (void **)&tmp) == FAILURE) {
-			yaf_trigger_error(YAF_ERR_TYPE_ERROR TSRMLS_CC, "%s", "You need to specify the controller by ':c'");
-			break;
-		}
-
-		smart_str_appendc(&tvalue, '/');
-		smart_str_appendl(&tvalue, Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-
-		if(zend_hash_find(Z_ARRVAL_P(info), ZEND_STRS(YAF_ROUTE_ASSEMBLE_ACTION_FORMAT), (void **)&tmp) == FAILURE) {
-			yaf_trigger_error(YAF_ERR_TYPE_ERROR TSRMLS_CC, "%s", "You need to specify the action by ':a'");
-			break;
-		}
-
-		smart_str_appendc(&tvalue, '/');
-		smart_str_appendl(&tvalue, Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-
-		if (query && IS_ARRAY == Z_TYPE_P(query)) {
-			uint key_len;
-			char *key;
-			ulong key_idx;
-
-			for (zend_hash_internal_pointer_reset(Z_ARRVAL_P(query));
-					zend_hash_get_current_data(Z_ARRVAL_P(query), (void **)&tmp) == SUCCESS;
-					zend_hash_move_forward(Z_ARRVAL_P(query))) {
-
-				if (IS_STRING == Z_TYPE_PP(tmp)
-						&& HASH_KEY_IS_STRING == zend_hash_get_current_key_ex(Z_ARRVAL_P(query), &key, &key_len, &key_idx, 0, NULL)) {
-					smart_str_appendc(&tvalue, '&');
-					smart_str_appendl(&tvalue, key, key_len - 1);
-					smart_str_appendc(&tvalue, '=');
-					smart_str_appendl(&tvalue, Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-				}
-			}
-		}
-
-		smart_str_0(&tvalue);
-		ZVAL_STRING(uri, tvalue.c, 1);
-		smart_str_free(&tvalue);
-		return uri;
-	} while (0);
-
-	smart_str_free(&tvalue);
-	ZVAL_NULL(uri);
-	return uri;
-}
-/* }}} */
 
 /** {{{ proto public Yaf_Route_Supervar::__construct(string $varname)
 */
 PHP_METHOD(yaf_route_supervar, __construct) {
-    zval *var;
+	zend_string *varname;
 
-    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z", &var) ==   FAILURE) {
-        YAF_UNINITIALIZED_OBJECT(getThis());
+    if (zend_parse_parameters_throw(ZEND_NUM_ARGS(), "S", &varname) == FAILURE) {
         return;
     }
 
-    if (Z_TYPE_P(var) != IS_STRING || !Z_STRLEN_P(var)) {
-        YAF_UNINITIALIZED_OBJECT(getThis());
-        yaf_trigger_error(YAF_ERR_TYPE_ERROR TSRMLS_CC, "Expects a valid string super var name", yaf_route_supervar_ce->name);
-        RETURN_FALSE;
-    }
-
-    zend_update_property(yaf_route_supervar_ce, getThis(), ZEND_STRL(YAF_ROUTE_SUPERVAR_PROPETY_NAME_VAR), var TSRMLS_CC);
+	yaf_route_supervar_init(Z_YAFROUTESUPEROBJ_P(getThis()), varname);
 }
 /** }}} */
 
 /** {{{ proto public Yaf_Route_Supervar::assemble(array $info[, array $query = NULL])
 */
 PHP_METHOD(yaf_route_supervar, assemble) {
+	zend_string *str;
     zval *info, *query = NULL;
-    zval *return_uri;
 
-    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "a|a", &info, &query) == FAILURE) {
+    if (zend_parse_parameters(ZEND_NUM_ARGS(), "a|a", &info, &query) == FAILURE) {
         return;
-    } else {
-        if ((return_uri = yaf_route_supervar_assemble(getThis(), info, query TSRMLS_CC))) {
-            RETURN_ZVAL(return_uri, 0, 1);
-        }
     }
-
+	if ((str = yaf_route_supervar_assemble(Z_YAFROUTESUPEROBJ_P(getThis()), info, query))) {
+		RETURN_STR(str);
+	}
+	RETURN_NULL();
 }
 /* }}} */
 
@@ -219,11 +233,21 @@ zend_function_entry yaf_route_supervar_methods[] = {
 YAF_STARTUP_FUNCTION(route_supervar) {
 	zend_class_entry ce;
 	YAF_INIT_CLASS_ENTRY(ce, "Yaf_Route_Supervar", "Yaf\\Route\\Supervar", yaf_route_supervar_methods);
-	yaf_route_supervar_ce = zend_register_internal_class_ex(&ce, NULL, NULL TSRMLS_CC);
-	zend_class_implements(yaf_route_supervar_ce TSRMLS_CC, 1, yaf_route_ce);
-	yaf_route_supervar_ce->ce_flags |= ZEND_ACC_FINAL_CLASS;
+	yaf_route_supervar_ce = zend_register_internal_class(&ce);
+	yaf_route_supervar_ce->ce_flags |= ZEND_ACC_FINAL;
 
-	zend_declare_property_null(yaf_route_supervar_ce, ZEND_STRL(YAF_ROUTE_SUPERVAR_PROPETY_NAME_VAR),  ZEND_ACC_PROTECTED TSRMLS_CC);
+	yaf_route_supervar_ce->create_object = yaf_route_supervar_new;
+	yaf_route_supervar_ce->serialize = zend_class_serialize_deny;
+	yaf_route_supervar_ce->unserialize = zend_class_unserialize_deny;
+
+	zend_class_implements(yaf_route_supervar_ce, 1, yaf_route_ce);
+
+	memcpy(&yaf_route_supervar_obj_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
+	yaf_route_supervar_obj_handlers.free_obj = yaf_route_supervar_object_free;
+	yaf_route_supervar_obj_handlers.clone_obj = NULL;
+	yaf_route_supervar_obj_handlers.get_gc = NULL;
+	yaf_route_supervar_obj_handlers.get_properties = yaf_route_supervar_get_properties;
+
 
 	return SUCCESS;
 }

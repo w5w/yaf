@@ -1,14 +1,15 @@
 # Yaf - Yet Another Framework  
-[![Build Status](https://secure.travis-ci.org/laruence/yaf.png)](https://travis-ci.org/laruence/yaf)
+[![Build Status](https://api.travis-ci.org/laruence/yaf.svg?branch=master)](https://travis-ci.org/laruence/yaf) [![Build status](https://ci.appveyor.com/api/projects/status/awii6wf2ocmy202p/branch/master?svg=true)](https://ci.appveyor.com/project/laruence/yaf/branch/master)
 
 PHP framework written in c and built as a PHP extension.
 
 ## Requirement
-- PHP 5.2 +
+- PHP 7.0+  (master branch))
+- PHP 5.2+  ([php5 branch](https://github.com/laruence/yaf/tree/php5))
 
 ## Install
 ### Install Yaf 
-Yaf is an PECL extension, thus you can simply install it by:
+Yaf is a PECL extension, thus you can simply install it by:
 
 ```
 $pecl install yaf
@@ -27,12 +28,12 @@ Yaf manual could be found at: http://www.php.net/manual/en/book.yaf.php
 efnet.org #php.yaf
 
 ## For IDE
-you could find a documented prototype script here: https://github.com/elad-yosifon/php-yaf-doc
+You could find a documented prototype script here: https://github.com/elad-yosifon/php-yaf-doc
 
 ## Tutorial
 
 ### layout
-A classic Application directory layout:
+A classic application directory layout:
 
 ```
 - .htaccess // Rewrite rules
@@ -50,15 +51,15 @@ A classic Application directory layout:
   + views    
      |+ index   
         - index.phtml // View template for default controller
-  - library
-  - models  // Models
-  - plugins // Plugins
+  + library // libraries
+  + models  // Models
+  + plugins // Plugins
 ```
 ### DocumentRoot
-you should set DocumentRoot to application/public, thus only the public folder can be accessed by user
+You should set `DocumentRoot` to `application/public`, thus only the public folder can be accessed by user
 
 ### index.php
-index.php in the public directory is the only way in of the application, you should rewrite all request to it(you can use .htaccess in Apache+php mod) 
+`index.php` in the public directory is the only way in of the application, you should rewrite all request to it(you can use `.htaccess` in Apache+php mod) 
 
 ```php
 <?php
@@ -105,13 +106,13 @@ $HTTP["host"] =~ "(www.)?domain.com$" {
 ```
 
 ### application.ini
-application.ini is the application config file
+`application.ini` is the application config file
 ```ini
 [product]
 ;CONSTANTS is supported
 application.directory = APPLICATION_PATH "/application/" 
 ```
-alternatively, you can use a PHP array instead: 
+Alternatively, you can use a PHP array instead: 
 ```php
 <?php
 $config = array(
@@ -125,7 +126,7 @@ $app  = new yaf_application($config);
   
 ```
 ### default controller
-In Yaf, the default controller is named IndexController:
+In Yaf, the default controller is named `IndexController`:
 
 ```php
 <?php
@@ -138,8 +139,8 @@ class IndexController extends Yaf_Controller_Abstract {
 ?>
 ```
 
-###view script
-The view script for default controller and default action is in the application/views/index/index.phtml, Yaf provides a simple view engineer called "Yaf_View_Simple", which supported the view template written by PHP.
+### view script
+The view script for default controller and default action is in the application/views/index/index.phtml, Yaf provides a simple view engine called "Yaf_View_Simple", which support the view template written in PHP.
 
 ```php
 <html>
@@ -152,11 +153,14 @@ The view script for default controller and default action is in the application/
 </html>
 ```
 
-## Run the Applicatioin
+## Run the Application
   http://www.yourhostname.com/
 
 ## Alternative
-you can generate the example above by using Yaf Code Generator:  https://github.com/laruence/php-yaf/tree/master/tools/cg
+You can generate the example above by using Yaf Code Generator:  https://github.com/laruence/php-yaf/tree/master/tools/cg
+```
+./yaf_cg -d output_directory [-a application_name] [--namespace]
+```
 
 ## More
 More info could be found at Yaf Manual: http://www.php.net/manual/en/book.yaf.php

@@ -14,13 +14,13 @@
   +----------------------------------------------------------------------+
 */
 
-
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
 #include "php.h"
-#include "ext/standard/php_smart_str.h" /* for smart_str */
+#include "Zend/zend_interfaces.h" /* for zend_class_serialize_deny */
+#include "ext/standard/php_string.h" /* php_trim */
 
 #include "php_yaf.h"
 #include "yaf_application.h"
@@ -29,7 +29,18 @@
 #include "yaf_loader.h"
 #include "yaf_exception.h"
 
+#define YAF_LOADER_CONTROLLER		"Controller"
+#define YAF_LOADER_MODEL			"Model"
+#define YAF_LOADER_PLUGIN			"Plugin"
+#define YAF_LOADER_RESERVERD		"Yaf_"
+
+#define YAF_CLASS_NAME_NORMAL       0
+#define YAF_CLASS_NAME_MODEL        1
+#define YAF_CLASS_NAME_PLUGIN       2
+#define YAF_CLASS_NAME_CONTROLLER   3
+
 zend_class_entry *yaf_loader_ce;
+static zend_object_handlers yaf_loader_obj_handlers;
 
 /** {{{ ARG_INFO
  */
@@ -46,7 +57,8 @@ ZEND_BEGIN_ARG_INFO_EX(yaf_loader_autoloader_arginfo, 0, 0, 1)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(yaf_loader_regnamespace_arginfo, 0, 0, 1)
-    ZEND_ARG_INFO(0, name_prefix)
+    ZEND_ARG_INFO(0, namespace)
+    ZEND_ARG_INFO(0, path)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(yaf_loader_islocalname_arginfo, 0, 0, 1)
@@ -67,507 +79,706 @@ ZEND_BEGIN_ARG_INFO_EX(yaf_loader_getlib_arginfo, 0, 0, 0)
 ZEND_END_ARG_INFO()
 /* }}} */
 
-/** {{{ int yaf_loader_register(TSRMLS_D)
-*/
-int yaf_loader_register(yaf_loader_t *loader TSRMLS_DC) {
-	zval *autoload, *method, *function, *ret = NULL;
-	zval **params[1] = {&autoload};
+static void yaf_loader_obj_free(zend_object *object) /* {{{ */ {
+	yaf_loader_object *loader = (yaf_loader_object*)object;
 
-	MAKE_STD_ZVAL(autoload);
-	array_init(autoload);
+	if (loader->library) {
+		zend_string_release(loader->library);
+	}
+	if (loader->glibrary) {
+		zend_string_release(loader->glibrary);
+	}
+	if (GC_DELREF(YAF_LOADER_NAMESPACES(loader)) == 0) {
+		GC_REMOVE_FROM_BUFFER(YAF_LOADER_NAMESPACES(loader));
+		zend_array_destroy(YAF_LOADER_NAMESPACES(loader));
+	}
+	if (loader->properties) {
+		if (GC_DELREF(loader->properties) == 0) {
+			GC_REMOVE_FROM_BUFFER(loader->properties);
+			zend_array_destroy(loader->properties);
+		}
+	}
 
-	MAKE_STD_ZVAL(method);
-	ZVAL_STRING(method, YAF_AUTOLOAD_FUNC_NAME, 1);
+	zend_object_std_dtor(object);
+}
+/* }}} */
 
-	zend_hash_next_index_insert(Z_ARRVAL_P(autoload), &loader, sizeof(yaf_loader_t *), NULL);
-	zend_hash_next_index_insert(Z_ARRVAL_P(autoload), &method, sizeof(zval *), NULL);
+int yaf_loader_register(yaf_loader_t *loader) /* {{{ */ {
+	zval autoload, function, method, ret;
 
-	MAKE_STD_ZVAL(function);
-	ZVAL_STRING(function, YAF_SPL_AUTOLOAD_REGISTER_NAME, 0);
+	array_init(&autoload);
+
+    ZVAL_STRING(&method, YAF_AUTOLOAD_FUNC_NAME);
+	Z_ADDREF_P(loader);
+	zend_hash_next_index_insert(Z_ARRVAL(autoload), loader);
+	zend_hash_next_index_insert(Z_ARRVAL(autoload), &method);
+
+	ZVAL_STRING(&function, YAF_SPL_AUTOLOAD_REGISTER_NAME);
 
 	do {
 		zend_fcall_info fci = {
 			sizeof(fci),
+#if PHP_VERSION_ID < 70100
 			EG(function_table),
+#endif
 			function,
+#if PHP_VERSION_ID < 70100
 			NULL,
+#endif
 			&ret,
-			1,
-			(zval ***)params,
+			&autoload,
 			NULL,
+			1,
 			1
 		};
 
-		if (zend_call_function(&fci, NULL TSRMLS_CC) == FAILURE) {
-			if (ret) {
-				zval_ptr_dtor(&ret);
-			}
-			efree(function);
+		if (zend_call_function(&fci, NULL) == FAILURE) {
+			zval_ptr_dtor(&function);
 			zval_ptr_dtor(&autoload);
-			php_error_docref(NULL TSRMLS_CC, E_WARNING, "Unable to register autoload function %s", YAF_AUTOLOAD_FUNC_NAME);
+			php_error_docref(NULL,
+					E_WARNING,
+					"Unable to register autoload function %s",
+					YAF_AUTOLOAD_FUNC_NAME);
 			return 0;
 		}
-
-		/*{{{ no use anymore
-		if (0 && !YAF_G(use_spl_autoload)) {
-			zend_function *reg_function;
-			zend_internal_function override_function = {
-				ZEND_INTERNAL_FUNCTION,
-				YAF_AUTOLOAD_FUNC_NAME,
-				NULL,
-				ZEND_ACC_PUBLIC,
-				NULL,
-				1,
-				0,
-				NULL,
-				0,
-				0,
-				ZEND_FN(yaf_override_spl_autoload),
-				NULL
-			};
-			zend_internal_function *internal_function = (zend_internal_function *)&override_function;
-			internal_function->type 	= ZEND_INTERNAL_FUNCTION;
-			internal_function->module 	= NULL;
-			internal_function->handler 	= ZEND_FN(yaf_override_spl_autoload);
-			internal_function->function_name = YAF_AUTOLOAD_FUNC_NAME;
-			internal_function->scope 	=  NULL;
-			internal_function->prototype = NULL;
-			internal_function->arg_info  = NULL;
-			internal_function->num_args  = 1;
-			internal_function->required_num_args = 0;
-			internal_function->pass_rest_by_reference = 0;
-			internal_function->return_reference = 0;
-			internal_function->fn_flags = ZEND_ACC_PUBLIC;
-			function_add_ref((zend_function*)&override_function);
-			//zend_register_functions
-			if (zend_hash_update(EG(function_table), YAF_SPL_AUTOLOAD_REGISTER_NAME,
-						sizeof(YAF_SPL_AUTOLOAD_REGISTER_NAME), &override_function, sizeof(zend_function), (void **)&reg_function) == FAILURE) {
-				YAF_DEBUG("register autoload failed");
-				 //no big deal
-			}
-		}
-		}}} */
-
-		if (ret) {
-			zval_ptr_dtor(&ret);
-		}
-		efree(function);
+		zval_ptr_dtor(&function);
 		zval_ptr_dtor(&autoload);
 	} while (0);
 	return 1;
 }
 /* }}} */
 
-/** {{{ static int yaf_loader_is_category(char *class, uint class_len, char *category, uint category_len TSRMLS_DC)
- */
-static int yaf_loader_is_category(char *class, uint class_len, char *category, uint category_len TSRMLS_DC) {
-	uint separator_len = YAF_G(name_separator_len);
+void yaf_loader_set_global_library_path(yaf_loader_object *loader, zend_string *global_library) /* {{{ */ {
+	if (EXPECTED(loader->glibrary)) {
+		zend_string_release(loader->glibrary);
+	}
+	loader->glibrary = zend_string_copy(global_library);
+}
+/* }}} */
 
-	if (YAF_G(name_suffix)) {
-		if (class_len > category_len && strncmp(class + class_len - category_len, category, category_len) == 0) {
-			if (!separator_len || strncmp(class + class_len - category_len - separator_len, YAF_G(name_separator), separator_len) == 0) {
-				return 1;
-			}
+static zend_array *yaf_loader_get_namespaces(yaf_loader_object *loader) /* {{{ */ {
+	zval *val, rv;
+	HashTable *ht;
+	zend_string *name;
+
+	ALLOC_HASHTABLE(ht);
+	zend_hash_init(ht, zend_hash_num_elements(YAF_LOADER_NAMESPACES(loader)), NULL, ZVAL_PTR_DTOR, 0);
+
+	ZEND_HASH_FOREACH_STR_KEY_VAL(YAF_LOADER_NAMESPACES(loader), name, val) {
+		ZEND_ASSERT(name);
+		if (Z_TYPE_P(val) == IS_NULL) {
+			ZVAL_STR_COPY(&rv, name);
+			zend_hash_next_index_insert(ht, &rv);
+		} else {
+			zend_hash_update(ht, name, val);
+			Z_TRY_ADDREF_P(val);
 		}
+	} ZEND_HASH_FOREACH_END();
+
+	return ht;
+}
+/* }}} */
+
+static HashTable *yaf_loader_get_properties(zval *object) /* {{{ */ {
+	zval rv;
+	HashTable *ht;
+	yaf_loader_object *loader = Z_YAFLOADEROBJ_P(object);
+
+	if (!loader->properties) {
+		ALLOC_HASHTABLE(loader->properties);
+		zend_hash_init(loader->properties, 4, NULL, ZVAL_PTR_DTOR, 0);
+		YAF_ALLOW_VIOLATION(loader->properties);;
+	}
+
+	ht = loader->properties;
+
+	ZVAL_STR_COPY(&rv, loader->library);
+	zend_hash_str_update(ht, "library:protected", sizeof("library:protected") - 1, &rv);
+	if (loader->glibrary) {
+		ZVAL_STR_COPY(&rv, loader->glibrary);
 	} else {
-		if (strncmp(class, category, category_len) == 0) {
-			if (!separator_len || strncmp(class + category_len, YAF_G(name_separator), separator_len) == 0) {
-				return 1;
-			}
-		}
+		ZVAL_NULL(&rv);
 	}
+	zend_hash_str_update(ht, "global_library:protected", sizeof("global_library:protected") - 1, &rv);
+	
+	ZVAL_ARR(&rv, yaf_loader_get_namespaces(loader));
+	zend_hash_str_update(ht, "namespace:protected", sizeof("namespace:protected") - 1, &rv);
 
-	return 0;
+	ZVAL_BOOL(&rv, yaf_loader_use_spl_autoload(loader));
+	zend_hash_str_update(ht, "use_spl_autoload:protected", sizeof("use_spl_autoload:protected") - 1, &rv);
+
+	ZVAL_BOOL(&rv, yaf_loader_is_lowcase_path(loader));
+	zend_hash_str_update(ht, "lowercase_path:protected", sizeof("lowercase_path:protected") - 1, &rv);
+
+	ZVAL_BOOL(&rv, yaf_loader_is_name_suffix(loader));
+	zend_hash_str_update(ht, "is_name_suffix:protected", sizeof("is_name_suffix:protected") - 1, &rv);
+
+	ZVAL_BOOL(&rv, yaf_loader_has_name_separator(loader));
+	zend_hash_str_update(ht, "has_name_seperator:protected", sizeof("has_name_seperator:protected") - 1, &rv);
+
+	return ht;
 }
 /* }}} */
 
-/** {{{ int yaf_loader_is_local_namespace(yaf_loader_t *loader, char *class_name, int len TSRMLS_DC)
- */
-int yaf_loader_is_local_namespace(yaf_loader_t *loader, char *class_name, int len TSRMLS_DC) {
-	char *pos, *ns, *prefix = NULL;
-	char orig_char = 0, *backup = NULL;
-	uint prefix_len = 0;
-
-	if (!YAF_G(local_namespaces)) {
-		return 0;
-	}
-
-	ns	= YAF_G(local_namespaces);
-
-	pos = strstr(class_name, "_");
-	if (pos) {
-		prefix_len 	= pos - class_name;
-		prefix 		= class_name;
-		backup = class_name + prefix_len;
-		orig_char = '_';
-		*backup = '\0';
-	}
-#ifdef YAF_HAVE_NAMESPACE
-	else if ((pos = strstr(class_name, "\\"))) {
-		prefix_len 	= pos - class_name;
-		prefix 		= estrndup(class_name, prefix_len);
-		orig_char = '\\';
-		backup = class_name + prefix_len;
-		*backup = '\0';
-	}
-#endif
-	else {
-		prefix = class_name;
-		prefix_len = len;
-	}
-
-	while ((pos = strstr(ns, prefix))) {
-		if ((pos == ns) && (*(pos + prefix_len) == DEFAULT_DIR_SEPARATOR || *(pos + prefix_len) == '\0')) {
-			if (backup) {
-				*backup = orig_char;
-			}
-#ifdef YAF_HAVE_NAMESPACE
-			if (prefix != class_name) {
-				efree(prefix);
-			}
-#endif
-			return 1;
-		} else if (*(pos - 1) == DEFAULT_DIR_SEPARATOR 
-				&& (*(pos + prefix_len) == DEFAULT_DIR_SEPARATOR || *(pos + prefix_len) == '\0')) {
-			if (backup) {
-				*backup = orig_char;
-			}
-#ifdef YAF_HAVE_NAMESPACE
-			if (prefix != class_name) {
-				efree(prefix);
-			}
-#endif
-			return 1;
-		}
-		ns = pos + prefix_len;
-	}
-
-	if (backup) {
-		*backup = orig_char;
-	}
-#ifdef YAF_HAVE_NAMESPACE
-	if (prefix != class_name) {
-		efree(prefix);
-	}
-#endif
-
-	return 0;
+void yaf_loader_reset(yaf_loader_object *loader) /* {{{ */ {
+	/* for back-compatibility of change of YAF_G after loader in initialized only */
+	YAF_LOADER_FLAGS(loader) = (zend_uchar)YAF_FLAGS();
 }
 /* }}} */
 
-/** {{{ yaf_loader_t * yaf_loader_instance(yaf_loader_t *this_ptr, char *library_path, char *global_path TSRMLS_DC)
- */
-yaf_loader_t * yaf_loader_instance(yaf_loader_t *this_ptr, char *library_path, char *global_path TSRMLS_DC) {
-	yaf_loader_t *instance;
-	zval *glibrary, *library;
+yaf_loader_t *yaf_loader_instance(zend_string *library_path) /* {{{ */ {
+	yaf_loader_object *loader;
+	yaf_loader_t *instance = &YAF_G(loader);
 
-	instance = zend_read_static_property(yaf_loader_ce, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_INSTANCE), 1 TSRMLS_CC);
-
-	if (IS_OBJECT == Z_TYPE_P(instance)) {
-	/* unecessary since there is no set_router things
-	   && instanceof_function(Z_OBJCE_P(instance), yaf_loader_ce TSRMLS_CC)) {
-	 */
-		if (library_path) {
-			MAKE_STD_ZVAL(library);
-			ZVAL_STRING(library, library_path, 1);
-			zend_update_property(yaf_loader_ce, instance, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_LIBRARY), library TSRMLS_CC);
-			zval_ptr_dtor(&library);
-		}
-
-		if (global_path) {
-			MAKE_STD_ZVAL(glibrary);
-			ZVAL_STRING(glibrary, global_path, 1);
-			zend_update_property(yaf_loader_ce, instance, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_GLOBAL_LIB), glibrary TSRMLS_CC);
-			zval_ptr_dtor(&glibrary);
-		}
+	if (EXPECTED(IS_OBJECT == Z_TYPE_P(instance))) {
 		return instance;
 	}
 
-	if (!global_path && !library_path) {
-		return NULL;
-	}
+	loader = emalloc(sizeof(yaf_loader_object));
+	zend_object_std_init(&loader->std, yaf_loader_ce);
+	loader->std.handlers = &yaf_loader_obj_handlers;
 
-	if (this_ptr) {
-		instance = this_ptr;
+	/* yaf_loader_reset(loader); */
+	YAF_LOADER_FLAGS(loader) = (zend_uchar)YAF_FLAGS();
+	if (library_path) {
+		loader->library = zend_string_copy(library_path);
 	} else {
-		MAKE_STD_ZVAL(instance);
-		object_init_ex(instance, yaf_loader_ce);
+		loader->library = ZSTR_EMPTY_ALLOC();
 	}
 
-	if (library_path && global_path) {
-		MAKE_STD_ZVAL(glibrary);
-		MAKE_STD_ZVAL(library);
-		ZVAL_STRING(glibrary, global_path, 1);
-		ZVAL_STRING(library, library_path, 1);
-		zend_update_property(yaf_loader_ce, instance, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_LIBRARY), library TSRMLS_CC);
-		zend_update_property(yaf_loader_ce, instance, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_GLOBAL_LIB), glibrary TSRMLS_CC);
-		zval_ptr_dtor(&library);
-		zval_ptr_dtor(&glibrary);
-	} else if (!global_path) {
-		MAKE_STD_ZVAL(library);
-		ZVAL_STRING(library, library_path, 1);
-		zend_update_property(yaf_loader_ce, instance, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_LIBRARY), library TSRMLS_CC);
-		zend_update_property(yaf_loader_ce, instance, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_GLOBAL_LIB), library TSRMLS_CC);
-		zval_ptr_dtor(&library);
+	if (*YAF_G(global_library)) {
+		loader->glibrary = zend_string_init(YAF_G(global_library), strlen(YAF_G(global_library)), 0);
 	} else {
-		MAKE_STD_ZVAL(glibrary);
-		ZVAL_STRING(glibrary, global_path, 1);
-		zend_update_property(yaf_loader_ce, instance, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_LIBRARY), glibrary TSRMLS_CC);
-		zend_update_property(yaf_loader_ce, instance, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_GLOBAL_LIB), glibrary TSRMLS_CC);
-		zval_ptr_dtor(&glibrary);
+		loader->glibrary = NULL;
 	}
 
-	if (!yaf_loader_register(instance TSRMLS_CC)) {
-		return NULL;
+	ZVAL_OBJ(&YAF_G(loader), &loader->std);
+	if (UNEXPECTED(!yaf_loader_register(&YAF_G(loader)))) {
+		php_error_docref(NULL, E_WARNING, "Failed to register autoload function");
 	}
+	
+	ALLOC_HASHTABLE(YAF_LOADER_NAMESPACES(loader));
+	zend_hash_init(YAF_LOADER_NAMESPACES(loader), 8, NULL, ZVAL_PTR_DTOR, 0);
+	YAF_ALLOW_VIOLATION(YAF_LOADER_NAMESPACES(loader));
 
-	zend_update_static_property(yaf_loader_ce, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_INSTANCE), instance TSRMLS_CC);
+	loader->properties = NULL;
 
-	return instance;
+	return &YAF_G(loader);
 }
 /* }}} */
 
-/** {{{ int yaf_loader_import(char *path, int len, int use_path TSRMLS_DC)
-*/
-int yaf_loader_import(char *path, int len, int use_path TSRMLS_DC) {
-	zend_file_handle file_handle;
-	zend_op_array 	*op_array;
-	char realpath[MAXPATHLEN];
+int yaf_loader_register_namespace(yaf_loader_object *loader, zend_string *class_name, zend_string *path) /* {{{ */ {
+	zval *entry, rv;
+	HashTable *target;
+	char *delim;
+	char *name = ZSTR_VAL(class_name);
+	uint32_t len = ZSTR_LEN(class_name);
 
-	if (!VCWD_REALPATH(path, realpath)) {
+	ZVAL_NULL(&rv);
+	target = YAF_LOADER_NAMESPACES(loader);
+
+	if (*name == '\\') {
+		name++;
+		len--;
+	}
+	if (((delim = memchr(name, '\\', len)) || (delim = memchr(name, '_', len)))) {
+		do {
+loop:
+			if ((entry = zend_hash_str_find(target, name, delim - name)) == NULL) {
+				entry = zend_hash_str_update(target, name, delim - name, &rv);
+				array_init(entry);
+			} else if (UNEXPECTED(Z_TYPE_P(entry) != IS_ARRAY)) {
+				zval_ptr_dtor(entry);
+				array_init(entry);
+			}
+			len -= delim - name + 1;
+			name = delim + 1;
+			target = Z_ARRVAL_P(entry);
+			if (((delim = memchr(name, '\\', len)) || (delim = memchr(name, '_', len)))) {
+				goto loop;
+			} else {
+				entry = zend_hash_str_update(target, name, len, &rv);
+			}
+		} while (0);
+	} else {
+		entry = zend_hash_str_update(YAF_LOADER_NAMESPACES(loader), name, len, &rv);
+	}
+
+	if (path) {
+		ZVAL_STR_COPY(entry, path);
+	}
+
+	return 1;
+}
+/* }}} */
+
+int yaf_loader_register_namespace_multi(yaf_loader_object *loader, zval *namespaces) /* {{{ */ {
+	zval *pzval;
+	HashTable *ht;
+	zend_string *key;
+
+	ht = Z_ARRVAL_P(namespaces);
+	ZEND_HASH_FOREACH_STR_KEY_VAL(ht, key, pzval) {
+		if (key == NULL) {
+			if (IS_STRING == Z_TYPE_P(pzval)) {
+				yaf_loader_register_namespace(loader, Z_STR_P(pzval), NULL);
+			}
+		} else {
+			if (IS_STRING == Z_TYPE_P(pzval)) {
+				yaf_loader_register_namespace(loader, key, Z_STR_P(pzval));
+			} else {
+				yaf_loader_register_namespace(loader, key, NULL);
+			}
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return 1;
+}
+/* }}} */
+
+static void yaf_loader_sanitize_path(char *name, uint32_t len) /* {{{ */ {
+	yaf_replace_chr(name, len, '_', DEFAULT_SLASH);
+}
+/* }}} */
+
+static void yaf_loader_sanitize_name(char *name, uint32_t len, char *buf) /* {{{ */ {
+	memcpy(buf, name, len);
+	/* replace all '\' to '_' */
+	yaf_replace_chr(buf, len, '\\', '_');
+}
+/* }}} */
+
+static zend_string *yaf_loader_resolve_namespace(yaf_loader_object *loader, const char *class_name, uint32_t *name_len) /* {{{ */ {
+	zval *name;
+	const char *delim;
+	uint32_t len = *name_len;
+	HashTable *target = YAF_LOADER_NAMESPACES(loader);
+
+	if ((delim = memchr(class_name, '_', len))) {
+		do {
+			if ((name = zend_hash_str_find(target, class_name, delim - class_name))) {
+				if (Z_TYPE_P(name) == IS_ARRAY) {
+					target = Z_ARRVAL_P(name);
+					len -= delim - class_name + 1;
+					class_name = delim + 1;
+				} else if (Z_TYPE_P(name) == IS_STRING) {
+					*name_len = (len - (delim - class_name + 1));
+					return Z_STR_P(name);
+				} else {
+					return (zend_string*)-1; /* use library path */
+				}
+			} else {
+				return NULL;
+			}
+		} while ((delim = memchr(class_name, '_', len)));
+	} else if ((name = zend_hash_str_find(target, class_name, len))) {
+		return Z_TYPE_P(name) == IS_STRING? Z_STR_P(name) : (zend_string*)-1;
+	}
+	return NULL;
+}
+/* }}} */
+
+static int yaf_loader_identify_category(yaf_loader_object *loader, zend_string *class_name) /* {{{ */ {
+	char *name = ZSTR_VAL(class_name);
+	size_t len = ZSTR_LEN(class_name);
+	char *suspense_name;
+	int suspense_len;
+	int suspense_type = YAF_CLASS_NAME_NORMAL;
+
+	if (EXPECTED(yaf_loader_is_name_suffix(loader))) {
+		switch (name[len - 1]) {
+			case 'l':
+				suspense_name = YAF_LOADER_MODEL;
+				suspense_len = sizeof(YAF_LOADER_MODEL) - 1;
+				suspense_type = YAF_CLASS_NAME_MODEL;
+				break;
+			case 'n':
+				suspense_name = YAF_LOADER_PLUGIN;
+				suspense_len = sizeof(YAF_LOADER_PLUGIN) - 1;
+				suspense_type = YAF_CLASS_NAME_PLUGIN;
+				break;
+			case 'r':
+				suspense_name = YAF_LOADER_CONTROLLER;
+				suspense_len = sizeof(YAF_LOADER_CONTROLLER) - 1;
+				suspense_type = YAF_CLASS_NAME_CONTROLLER;
+				break;
+			default:
+				return YAF_CLASS_NAME_NORMAL;
+		}
+		if (len <= suspense_len || !yaf_slip_equal(name + len - suspense_len, suspense_name, suspense_len - 1)) {
+			return YAF_CLASS_NAME_NORMAL;
+		}
+		if (UNEXPECTED(yaf_loader_has_name_separator(loader))) {
+			name += (len - suspense_len);
+			if (len > YAF_G(name_separator_len) &&
+				memcmp(name - YAF_G(name_separator_len), YAF_G(name_separator), YAF_G(name_separator_len)) == 0) {
+				return suspense_type;
+			}
+			return YAF_CLASS_NAME_NORMAL;
+		}
+		return suspense_type;
+	} else {
+		switch (*name) {
+			case 'M':
+				suspense_name = YAF_LOADER_MODEL;
+				suspense_len = sizeof(YAF_LOADER_MODEL) - 1;
+				suspense_type = YAF_CLASS_NAME_MODEL;
+				break;
+			case 'P':
+				suspense_name = YAF_LOADER_PLUGIN;
+				suspense_len = sizeof(YAF_LOADER_PLUGIN) - 1;
+				suspense_type = YAF_CLASS_NAME_PLUGIN;
+				break;
+			case 'C':
+				suspense_name = YAF_LOADER_CONTROLLER;
+				suspense_len = sizeof(YAF_LOADER_CONTROLLER) - 1;
+				suspense_type = YAF_CLASS_NAME_CONTROLLER;
+				break;
+			default:
+				return YAF_CLASS_NAME_NORMAL;
+		}
+		if (len <= suspense_len || !yaf_slip_equal(name + 1, suspense_name + 1, suspense_len - 1)) {
+			return YAF_CLASS_NAME_NORMAL;
+		}
+		if (UNEXPECTED(yaf_loader_has_name_separator(loader))) {
+			name += suspense_len;
+			if (len > YAF_G(name_separator_len) &&
+				memcmp(name, YAF_G(name_separator), YAF_G(name_separator_len)) == 0) {
+				return suspense_type;
+			}
+			return YAF_CLASS_NAME_NORMAL;
+		}
+		return suspense_type;
+	}
+}
+/* }}} */
+
+ZEND_HOT int yaf_loader_import(const char *path, uint32_t len) /* {{{ */ {
+	zend_file_handle file_handle;
+	zend_op_array *op_array;
+	zend_stat_t sb;
+
+	if (UNEXPECTED(VCWD_STAT(path, &sb) == -1)) {
 		return 0;
 	}
 
+#if PHP_VERSION_ID < 70400
 	file_handle.filename = path;
-	file_handle.free_filename = 0;
 	file_handle.type = ZEND_HANDLE_FILENAME;
+	file_handle.free_filename = 0;
 	file_handle.opened_path = NULL;
 	file_handle.handle.fp = NULL;
-
-	op_array = zend_compile_file(&file_handle, ZEND_INCLUDE TSRMLS_CC);
-
-	if (op_array && file_handle.handle.stream.handle) {
-		int dummy = 1;
-
-		if (!file_handle.opened_path) {
-			file_handle.opened_path = path;
-		}
-
-		zend_hash_add(&EG(included_files), file_handle.opened_path, strlen(file_handle.opened_path)+1, (void *)&dummy, sizeof(int), NULL);
-	}
-	zend_destroy_file_handle(&file_handle TSRMLS_CC);
-
-	if (op_array) {
-		zval *result = NULL;
-
-		YAF_STORE_EG_ENVIRON();
-
-		EG(return_value_ptr_ptr) = &result;
-		EG(active_op_array) 	 = op_array;
-
-#if ((PHP_MAJOR_VERSION == 5) && (PHP_MINOR_VERSION > 2)) || (PHP_MAJOR_VERSION > 5)
-		if (!EG(active_symbol_table)) {
-#if PHP_MINOR_VERSION < 5
-			zval *orig_this = EG(This);
-			EG(This) = NULL;
-			zend_rebuild_symbol_table(TSRMLS_C);
-			EG(This) = orig_this;
 #else
-			zend_rebuild_symbol_table(TSRMLS_C);
+	/* setup file-handle */
+	zend_stream_init_filename(&file_handle, path);
 #endif
 
-		}
-#endif
-		zend_execute(op_array TSRMLS_CC);
-
-		destroy_op_array(op_array TSRMLS_CC);
-		efree(op_array);
-		if (!EG(exception)) {
-			if (EG(return_value_ptr_ptr) && *EG(return_value_ptr_ptr)) {
-				zval_ptr_dtor(EG(return_value_ptr_ptr));
+	if (EXPECTED((op_array = zend_compile_file(&file_handle, ZEND_INCLUDE)))) {
+		zval result;
+		if (EXPECTED(file_handle.handle.stream.handle)) {
+			if (UNEXPECTED(!file_handle.opened_path)) {
+				file_handle.opened_path = zend_string_init(path, len, 0);
 			}
+			zend_hash_add_empty_element(&EG(included_files), file_handle.opened_path);
 		}
-		YAF_RESTORE_EG_ENVIRON();
-	    return 1;
+
+        /* ZVAL_UNDEF(&result); */
+		zend_execute(op_array, &result);
+		destroy_op_array(op_array);
+		efree_size(op_array, sizeof(zend_op_array));
+        /* zval_ptr_dtor(&result); */
+		zend_destroy_file_handle(&file_handle);
+
+		return 1;
 	}
 
+	zend_destroy_file_handle(&file_handle);
 	return 0;
 }
 /* }}} */
 
-/** {{{ int yaf_internal_autoload(char * file_name, uint name_len, char **directory TSRMLS_DC)
- */
-int yaf_internal_autoload(char *file_name, uint name_len, char **directory TSRMLS_DC) {
-	zval *library_dir, *global_dir;
-	char *q, *p, *seg;
-	uint seg_len, directory_len, status;
-	char *ext = YAF_G(ext);
-	smart_str buf = {0};
+ZEND_HOT int yaf_loader_load_internal(yaf_loader_object *loader, char *filename, size_t fname_len, char *directory, uint32_t directory_len) /* {{{ */ {
+   char *ext;
+   uint32_t ext_len;
+   yaf_application_object *app = yaf_application_instance();
 
-	if (NULL == *directory) {
-		char *library_path;
-		uint  library_path_len;
-		yaf_loader_t *loader;
+   if (UNEXPECTED(app->ext)) {
+	   ext = ZSTR_VAL(app->ext);
+	   ext_len = ZSTR_LEN(app->ext);
+   } else {
+	   ext = YAF_DEFAULT_EXT;
+	   ext_len = sizeof(YAF_DEFAULT_EXT) - 1;
+   }
 
-		loader = yaf_loader_instance(NULL, NULL, NULL TSRMLS_CC);
+   if (UNEXPECTED((directory_len + fname_len + ext_len + 3) > MAXPATHLEN)) {
+	   directory[directory_len] = '\0';
+	   return 0;
+   }
 
-		if (!loader) {
-			/* since only call from userspace can cause loader is NULL, exception throw will works well */
-			php_error_docref(NULL TSRMLS_CC, E_WARNING, "%s need to be initialize first", yaf_loader_ce->name);
-			return 0;
+   directory[directory_len] = DEFAULT_SLASH;
+   memcpy(directory + directory_len + 1, filename, fname_len);
+   filename = directory + directory_len + 1;
+   if (UNEXPECTED(yaf_loader_is_lowcase_path(loader))) {
+	   zend_str_tolower(filename, fname_len);
+   }
+   yaf_loader_sanitize_path(filename, fname_len);
+   directory[directory_len + 1 + fname_len] = '.';
+   memcpy(directory + directory_len + 1 + fname_len + 1, ext, ext_len);
+   /* aussume all the path is not end in slash */
+   directory[directory_len + 1 + fname_len + 1 + ext_len] = '\0';
+   directory_len = directory_len + 1 + fname_len + 1 + ext_len;
+
+   return yaf_loader_import(directory, directory_len);
+}
+/* }}} */
+
+ZEND_HOT static int yaf_loader_load_user(yaf_loader_object *loader, char *buf, uint32_t len) /* {{{ */ {
+	zend_string *library_dir;
+	const char *ext;
+	char *name = buf;
+	uint32_t ext_len;
+	uint32_t origin_len = len;
+	yaf_application_object *app = yaf_application_instance();
+
+	if ((library_dir = yaf_loader_resolve_namespace(loader, buf, &len))) {
+		if (library_dir == ((zend_string*)-1)) {
+			library_dir = loader->library;
 		} else {
-			library_dir = zend_read_property(yaf_loader_ce, loader, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_LIBRARY), 1 TSRMLS_CC);
-			global_dir	= zend_read_property(yaf_loader_ce, loader, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_GLOBAL_LIB), 1 TSRMLS_CC);
+			name += (origin_len - len);
+		}
+	} else {
+		if (!loader->glibrary) {
+			library_dir = loader->library;
+		} else {
+			library_dir = loader->glibrary;
+		}
+	}
 
-			if (yaf_loader_is_local_namespace(loader, file_name, name_len TSRMLS_CC)) {
-				library_path = Z_STRVAL_P(library_dir);
-				library_path_len = Z_STRLEN_P(library_dir);
+	if (UNEXPECTED(yaf_loader_is_lowcase_path(loader))) {
+		zend_str_tolower(name, len);
+	}
+	yaf_loader_sanitize_path(name, len);
+
+	if (EXPECTED(app) && UNEXPECTED(app->ext)) {
+		ext = ZSTR_VAL(app->ext);
+		ext_len = ZSTR_LEN(app->ext);
+	} else {
+		ext = YAF_DEFAULT_EXT;
+		ext_len = sizeof(YAF_DEFAULT_EXT) - 1;
+	}
+
+	ZEND_ASSERT(library_dir);
+	if (UNEXPECTED(ZSTR_LEN(library_dir) + len + ext_len + 2 > MAXPATHLEN)) {
+		return 0;
+	}
+
+	memmove(buf + ZSTR_LEN(library_dir) + 1, name, len);
+	memcpy(buf, ZSTR_VAL(library_dir), ZSTR_LEN(library_dir));
+	buf[ZSTR_LEN(library_dir)] = DEFAULT_SLASH;
+	buf[ZSTR_LEN(library_dir) + 1 + len] = '.';
+	memcpy(buf + ZSTR_LEN(library_dir) + 1 + len + 1, ext, ext_len);
+	buf[ZSTR_LEN(library_dir) + 1 + len + 1 + ext_len] = '\0';
+	len = ZSTR_LEN(library_dir) + 1 + len + 1 + ext_len;
+
+	return yaf_loader_import(buf, len);
+}
+/* }}} */
+
+static zend_never_inline int yaf_loader_load_mvc(yaf_loader_object *loader, char *buf, uint32_t len, int type) /* {{{ */ {
+	char *name;
+	const char *folder, *ext;
+	uint32_t folder_len, ext_len;
+	zend_string *library_dir;
+	yaf_application_object *app = yaf_application_instance();
+
+	if (UNEXPECTED(app == NULL)) {
+		php_error_docref(NULL, E_WARNING, "Couldn't load a MVC class unless an %s is initialized", ZSTR_VAL(yaf_application_ce->name));
+		*buf = '\0';
+		return 0;
+	}
+
+	switch (type) {
+		case YAF_CLASS_NAME_MODEL:
+			folder = YAF_MODEL_DIRECTORY_NAME;
+			folder_len = sizeof(YAF_MODEL_DIRECTORY_NAME) - 1;
+			break;
+		case YAF_CLASS_NAME_PLUGIN:
+			folder = YAF_PLUGIN_DIRECTORY_NAME;
+			folder_len = sizeof(YAF_PLUGIN_DIRECTORY_NAME) - 1;
+			break;
+		case YAF_CLASS_NAME_CONTROLLER:
+			folder = YAF_CONTROLLER_DIRECTORY_NAME;
+			folder_len = sizeof(YAF_CONTROLLER_DIRECTORY_NAME) - 1;
+			break;
+		default:
+			ZEND_ASSERT(0);
+			break;
+	}
+
+	len -= (folder_len - 1); /* models -> model etc*/
+	if (EXPECTED(yaf_loader_is_name_suffix(loader))) {
+		name = buf;
+		if (UNEXPECTED(yaf_loader_has_name_separator(loader))) {
+			len -= YAF_G(name_separator_len);
+		}
+	} else {
+		name = buf + folder_len - 1;
+		if (UNEXPECTED(yaf_loader_has_name_separator(loader))) {
+			name += YAF_G(name_separator_len);
+			len -= YAF_G(name_separator_len);
+		}
+	}
+	if (UNEXPECTED(yaf_loader_is_lowcase_path(loader))) {
+		zend_str_tolower(name, len);
+	}
+	yaf_loader_sanitize_path(name, len);
+
+	if (UNEXPECTED(app->ext)) {
+		ext = ZSTR_VAL(app->ext);
+		ext_len = ZSTR_LEN(app->ext);
+	} else {
+		ext = YAF_DEFAULT_EXT;
+		ext_len = sizeof(YAF_DEFAULT_EXT) - 1;
+	}
+
+	if (UNEXPECTED(ZSTR_LEN(app->directory) + 1 + folder_len + 1 + len + 1 + ext_len > MAXPATHLEN)) {
+		php_error_docref(NULL, E_WARNING, "Path too long '%s'", ZSTR_VAL(app->directory));
+		*buf = '\0';
+		return 0;
+	}
+
+	library_dir = app->directory;
+	memmove(buf + ZSTR_LEN(library_dir) + 1 + folder_len + 1, name, len);
+	memcpy(buf, ZSTR_VAL(library_dir), ZSTR_LEN(library_dir));
+	buf[ZSTR_LEN(library_dir)] = DEFAULT_SLASH;
+	memcpy(buf + ZSTR_LEN(library_dir) + 1, folder, folder_len);
+	buf[ZSTR_LEN(library_dir) + 1 + folder_len] = DEFAULT_SLASH;
+	buf[ZSTR_LEN(library_dir) + 1 + folder_len + 1 + len] = '.';
+	memcpy(buf + ZSTR_LEN(library_dir) + 1 + folder_len + 1 + len + 1, ext, ext_len);
+	buf[ZSTR_LEN(library_dir) + 1 + folder_len + 1 + len + 1 + ext_len] = '\0';
+
+	return yaf_loader_import(buf, len);
+}
+/* }}} */
+
+/** {{{ proto public Yaf_Loader::autoload($class_name)
+*/
+PHP_METHOD(yaf_loader, autoload) {
+	char directory[MAXPATHLEN];
+	uint32_t class_type, status;
+	zend_string *class_name;
+	zend_string *unqualified = NULL;
+	yaf_loader_object *loader = Z_YAFLOADEROBJ_P(getThis());
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_STR(class_name)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (UNEXPECTED(ZSTR_LEN(class_name) == 0 || ZSTR_LEN(class_name) > MAXPATHLEN)) {
+		RETURN_FALSE;
+	}
+
+	/*
+	if (UNEXPECTED(ZSTR_LEN(class_name) >= sizeof(YAF_LOADER_RESERVERD) - 1 &&
+		yaf_slip_equal(ZSTR_VAL(class_name), YAF_LOADER_RESERVERD, sizeof(YAF_LOADER_RESERVERD) - 1))) {
+		php_error_docref(NULL, E_WARNING, "You should not use '%s' as class name prefix", YAF_LOADER_RESERVERD);
+	}
+	*/
+	if (ZSTR_VAL(class_name)[0] == '\\') {
+		unqualified = zend_string_init(ZSTR_VAL(class_name) + 1, ZSTR_LEN(class_name) - 1, 0);
+		class_name = unqualified;
+	}
+	yaf_loader_sanitize_name(ZSTR_VAL(class_name), ZSTR_LEN(class_name), directory);
+	if ((class_type = yaf_loader_identify_category(loader, class_name)) == YAF_CLASS_NAME_NORMAL) {
+		status = yaf_loader_load_user(loader, directory, ZSTR_LEN(class_name));
+	} else {
+		status = yaf_loader_load_mvc(loader, directory, ZSTR_LEN(class_name), class_type);
+	}
+
+	if (unqualified) {
+		zend_string_release(unqualified);
+	}
+	if (EXPECTED(!yaf_loader_use_spl_autoload(loader))) {
+		if (EXPECTED(status)) {
+			zend_string *lc_name = zend_string_tolower(class_name);
+			if (UNEXPECTED(!zend_hash_exists(EG(class_table), lc_name))) {
+				php_error_docref(NULL, E_WARNING, "Could not find class %s in %s", ZSTR_VAL(class_name), directory);
+			}
+			zend_string_release(lc_name);
+		} else if (*directory) {
+			php_error_docref(NULL, E_WARNING, "Failed opening script %s: %s", directory, strerror(errno));
+		}
+		RETURN_TRUE;
+	}
+	RETURN_BOOL(status);
+}
+/* }}} */
+
+/** {{{ proto public static Yaf_Loader::import($file)
+*/
+PHP_METHOD(yaf_loader, import) {
+	zend_string *file;
+	int need_free = 0;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_STR(file)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (ZSTR_LEN(file) == 0) {
+		RETURN_FALSE;
+	} else {
+		int retval;
+
+		if (!IS_ABSOLUTE_PATH(ZSTR_VAL(file), ZSTR_LEN(file))) {
+			if (UNEXPECTED(Z_TYPE(YAF_G(loader)) != IS_OBJECT)) {
+				php_error_docref(NULL, E_WARNING, "%s need to be initialize first", ZSTR_VAL(yaf_loader_ce->name));
+				RETURN_FALSE;
 			} else {
-				library_path = Z_STRVAL_P(global_dir);
-				library_path_len = Z_STRLEN_P(global_dir);
+				yaf_loader_object *loader = Z_YAFLOADEROBJ(YAF_G(loader));
+				zend_string *library = loader->library;
+				file = strpprintf(0, "%s%c%s", ZSTR_VAL(library), DEFAULT_SLASH, ZSTR_VAL(file));
+				need_free = 1;
 			}
 		}
 
-		if (NULL == library_path) {
-			php_error_docref(NULL TSRMLS_CC, E_WARNING, "%s requires %s(which set the library_directory) to be initialized first", yaf_loader_ce->name, yaf_application_ce->name);
-			return 0;
+		retval = zend_hash_exists(&EG(included_files), file);
+		if (retval) {
+			if (need_free) {
+				zend_string_release(file);
+			}
+			RETURN_TRUE;
 		}
 
-		smart_str_appendl(&buf, library_path, library_path_len);
-	} else {
-		smart_str_appendl(&buf, *directory, strlen(*directory));
-		efree(*directory);
-	}
-
-	directory_len = buf.len;
-
-	/* aussume all the path is not end in slash */
-	smart_str_appendc(&buf, DEFAULT_SLASH);
-
-	p = file_name;
-	q = p;
-
-	while (1) {
-		while(++q && *q != '_' && *q != '\0');
-
-		if (*q != '\0') {
-			seg_len	= q - p;
-			seg	 	= estrndup(p, seg_len);
-			smart_str_appendl(&buf, seg, seg_len);
-			efree(seg);
-			smart_str_appendc(&buf, DEFAULT_SLASH);
-			p 		= q + 1;
-		} else {
-			break;
+		retval = yaf_loader_import(ZSTR_VAL(file), ZSTR_LEN(file));
+		if (need_free) {
+			zend_string_release(file);
 		}
+
+		RETURN_BOOL(retval);
 	}
-
-	if (YAF_G(lowcase_path)) {
-		/* all path of library is lowercase */
-		zend_str_tolower(buf.c + directory_len, buf.len - directory_len);
-	}
-
-	smart_str_appendl(&buf, p, strlen(p));
-	smart_str_appendc(&buf, '.');
-	smart_str_appendl(&buf, ext, strlen(ext));
-
-	smart_str_0(&buf);
-
-	if (directory) {
-		*(directory) = estrndup(buf.c, buf.len);
-	}
-
-	status = yaf_loader_import(buf.c, buf.len, 0 TSRMLS_CC);
-	smart_str_free(&buf);
-
-	if (!status)
-	   	return 0;
-
-	return 1;
 }
 /* }}} */
 
-/** {{{ int yaf_loader_register_namespace_single(char *prefix, uint len TSRMLS_DC)
- */
-int yaf_loader_register_namespace_single(char *prefix, uint len TSRMLS_DC) {
-
-	if (YAF_G(local_namespaces)) {
-		uint orig_len = strlen(YAF_G(local_namespaces));
-		YAF_G(local_namespaces) = erealloc(YAF_G(local_namespaces), orig_len + 1 + len + 1);
-		snprintf(YAF_G(local_namespaces) + orig_len, len + 2, "%c%s", DEFAULT_DIR_SEPARATOR, prefix);
-	} else {
-		YAF_G(local_namespaces) = emalloc(len + 1 + 1);
-		snprintf(YAF_G(local_namespaces), len + 2, "%s", prefix);
-	}
-
-	return 1;
-}
-/* }}} */
-
-/** {{{ int yaf_loader_register_namespace_multi(zval *prefixes TSRMLS_DC)
- */
-int yaf_loader_register_namespace_multi(zval *prefixes TSRMLS_DC) {
-	zval **ppzval;
-	HashTable *ht;
-
-	ht = Z_ARRVAL_P(prefixes);
-	for(zend_hash_internal_pointer_reset(ht);
-			zend_hash_has_more_elements(ht) == SUCCESS;
-			zend_hash_move_forward(ht)) {
-		if (zend_hash_get_current_data(ht, (void**)&ppzval) == FAILURE) {
-			continue;
-		} else if (IS_STRING == Z_TYPE_PP(ppzval)) {
-			yaf_loader_register_namespace_single(Z_STRVAL_PP(ppzval), Z_STRLEN_PP(ppzval) TSRMLS_CC);
-		}
-	}
-
-	return 1;
-}
-/* }}} */
-
-/** {{{ proto private Yaf_Loader::__construct(void)
-*/
-PHP_METHOD(yaf_loader, __construct) {
-}
-/* }}} */
-
-/** {{{ proto private Yaf_Loader::__sleep(void)
-*/
-PHP_METHOD(yaf_loader, __sleep) {
-}
-/* }}} */
-
-/** {{{ proto private Yaf_Loader::__wakeup(void)
-*/
-PHP_METHOD(yaf_loader, __wakeup) {
-}
-/* }}} */
-
-/** {{{ proto private Yaf_Loader::__clone(void)
-*/
-PHP_METHOD(yaf_loader, __clone) {
-}
-/* }}} */
-
-/** {{{ proto public Yaf_Loader::registerLocalNamespace(mixed $namespace)
+/** {{{ proto public Yaf_Loader::registerLocalNamespace(mixed $namespace, string $path = NULL)
 */
 PHP_METHOD(yaf_loader, registerLocalNamespace) {
 	zval *namespaces;
+	zend_string *path = NULL;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z", &namespaces) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "z|S", &namespaces, &path) == FAILURE) {
 		return;
 	}
 
 	if (IS_STRING == Z_TYPE_P(namespaces)) {
-		if (yaf_loader_register_namespace_single(Z_STRVAL_P(namespaces), Z_STRLEN_P(namespaces) TSRMLS_CC)) {
+		if (yaf_loader_register_namespace(Z_YAFLOADEROBJ_P(getThis()), Z_STR_P(namespaces), path)) {
 			RETURN_ZVAL(getThis(), 1, 0);
 		}
 	} else if (IS_ARRAY == Z_TYPE_P(namespaces)) {
-		if(yaf_loader_register_namespace_multi(namespaces TSRMLS_CC)) {
+		if (yaf_loader_register_namespace_multi(Z_YAFLOADEROBJ_P(getThis()), namespaces)) {
 			RETURN_ZVAL(getThis(), 1, 0);
 		}
 	} else {
-		php_error_docref(NULL TSRMLS_CC, E_WARNING, "Invalid parameters provided, must be a string, or an array");
+		php_error_docref(NULL, E_WARNING, "Invalid parameters provided, must be a string, or an array");
 	}
 
 	RETURN_FALSE;
@@ -577,18 +788,26 @@ PHP_METHOD(yaf_loader, registerLocalNamespace) {
 /** {{{ proto public Yaf_Loader::getLocalNamespace(void)
 */
 PHP_METHOD(yaf_loader, getLocalNamespace) {
-	if (YAF_G(local_namespaces)) {
-		RETURN_STRING(YAF_G(local_namespaces), 1);
+	yaf_loader_object *loader = Z_YAFLOADEROBJ_P(getThis());
+
+	if (zend_parse_parameters_none() == FAILURE) {
+		return;
 	}
-	RETURN_NULL();
+
+	ZVAL_ARR(return_value, yaf_loader_get_namespaces(loader));
 }
 /* }}} */
 
 /** {{{ proto public Yaf_Loader::clearLocalNamespace(void)
 */
 PHP_METHOD(yaf_loader, clearLocalNamespace) {
-	efree(YAF_G(local_namespaces));
-	YAF_G(local_namespaces) = NULL;
+	yaf_loader_object *loader = Z_YAFLOADEROBJ_P(getThis());
+
+	if (zend_parse_parameters_none() == FAILURE) {
+		return;
+	}
+
+	zend_hash_clean(YAF_LOADER_NAMESPACES(loader));
 
 	RETURN_TRUE;
 }
@@ -597,35 +816,90 @@ PHP_METHOD(yaf_loader, clearLocalNamespace) {
 /** {{{ proto public Yaf_Loader::isLocalName(string $class_name)
 */
 PHP_METHOD(yaf_loader, isLocalName) {
-	zval *name;
+	zend_string *name;
+	int result;
+	char *sanitized_name;
+	uint32_t sanitized_len;
+	yaf_loader_object *loader = Z_YAFLOADEROBJ_P(getThis());
+	ALLOCA_FLAG(use_heap);
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z", &name) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "S", &name) == FAILURE) {
 		return;
 	}
 
-	if (Z_TYPE_P(name) != IS_STRING) {
-		RETURN_FALSE;
+	if (ZSTR_VAL(name)[0] == '\\') {
+		sanitized_len = ZSTR_LEN(name) - 1;
+		sanitized_name = do_alloca(sanitized_len, use_heap);
+		yaf_loader_sanitize_name(ZSTR_VAL(name) + 1, sanitized_len, sanitized_name);
+	} else {
+		sanitized_len = ZSTR_LEN(name);
+		sanitized_name = do_alloca(sanitized_len, use_heap);
+		yaf_loader_sanitize_name(ZSTR_VAL(name), sanitized_len, sanitized_name);
+	}
+	result = YAF_LOADER_NAMESPACES(loader) && yaf_loader_resolve_namespace(loader, sanitized_name, &sanitized_len);
+	free_alloca(sanitized_name, use_heap);
+
+	RETURN_BOOL(result);
+}
+/* }}} */
+
+/** {{{ proto public Yaf_Loader::getNamespacePath(string $class_name)
+*/
+PHP_METHOD(yaf_loader, getNamespacePath) {
+	zend_string *name;
+	zend_string *path;
+	char *sanitized_name;
+	uint32_t sanitized_len;
+	yaf_loader_object *loader = Z_YAFLOADEROBJ_P(getThis());
+	ALLOCA_FLAG(use_heap);
+
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "S", &name) == FAILURE) {
+		return;
 	}
 
-	RETURN_BOOL(yaf_loader_is_local_namespace(getThis(), Z_STRVAL_P(name), Z_STRLEN_P(name) TSRMLS_CC));
+	if (ZSTR_VAL(name)[0] == '\\') {
+		sanitized_len = ZSTR_LEN(name) - 1;
+		sanitized_name = do_alloca(sanitized_len, use_heap);
+		yaf_loader_sanitize_name(ZSTR_VAL(name) + 1, sanitized_len, sanitized_name);
+	} else {
+		sanitized_len = ZSTR_LEN(name);
+		sanitized_name = do_alloca(sanitized_len, use_heap);
+		yaf_loader_sanitize_name(ZSTR_VAL(name), sanitized_len, sanitized_name);
+	}
+	if ((path = yaf_loader_resolve_namespace(loader, sanitized_name, &sanitized_len))) {
+		if (path == ((zend_string*)-1)) {
+			RETVAL_STR_COPY(loader->library);
+		} else {
+			RETVAL_STR_COPY(path);
+		}
+	} else {
+		if (loader->glibrary) {
+			RETVAL_STR_COPY(loader->glibrary);
+		} else {
+			RETVAL_STR_COPY(loader->library);
+		}
+	}
+	free_alloca(sanitized_name, use_heap);
+
+	return;
 }
 /* }}} */
 
 /** {{{ proto public Yaf_Loader::setLibraryPath(string $path, $global = FALSE)
 */
 PHP_METHOD(yaf_loader, setLibraryPath) {
-	char *library;
-	uint len;
+	zend_string *library;
 	zend_bool global = 0;
+	yaf_loader_object *loader = Z_YAFLOADEROBJ_P(getThis());
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|b", &library, &len, &global) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "S|b", &library, &global) == FAILURE) {
 		return;
 	}
 
 	if (!global) {
-		zend_update_property_stringl(yaf_loader_ce, getThis(), ZEND_STRL(YAF_LOADER_PROPERTY_NAME_LIBRARY), library, len TSRMLS_CC);
+		yaf_loader_set_library_path(loader, library);
 	} else {
-		zend_update_property_stringl(yaf_loader_ce, getThis(), ZEND_STRL(YAF_LOADER_PROPERTY_NAME_GLOBAL_LIB), library, len TSRMLS_CC);
+		yaf_loader_set_global_library_path(loader, library);
 	}
 
 	RETURN_ZVAL(getThis(), 1, 0);
@@ -635,251 +909,19 @@ PHP_METHOD(yaf_loader, setLibraryPath) {
 /** {{{ proto public Yaf_Loader::getLibraryPath($global = FALSE)
 */
 PHP_METHOD(yaf_loader, getLibraryPath) {
-	zval *library;
 	zend_bool global = 0;
+	yaf_loader_object *loader = Z_YAFLOADEROBJ_P(getThis());
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|b", &global) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "|b", &global) == FAILURE) {
 		return;
 	}
 
 	if (!global) {
-		library = zend_read_property(yaf_loader_ce, getThis(), ZEND_STRL(YAF_LOADER_PROPERTY_NAME_LIBRARY), 1 TSRMLS_CC);
+		RETURN_STR_COPY(loader->library);
+	} else if (loader->glibrary) {
+		RETURN_STR_COPY(loader->glibrary);
 	} else {
-		library = zend_read_property(yaf_loader_ce, getThis(), ZEND_STRL(YAF_LOADER_PROPERTY_NAME_GLOBAL_LIB), 1 TSRMLS_CC);
-	}
-
-	RETURN_ZVAL(library, 1, 0);
-}
-/* }}} */
-
-/** {{{ proto public static Yaf_Loader::import($file)
-*/
-PHP_METHOD(yaf_loader, import) {
-	char *file;
-	uint len, need_free = 0;
-
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s" ,&file, &len) == FAILURE) {
-		return;
-	}
-
-	if (!len) {
-		RETURN_FALSE;
-	} else {
-		int  retval = 0;
-
-		if (!IS_ABSOLUTE_PATH(file, len)) {
-			yaf_loader_t *loader = yaf_loader_instance(NULL, NULL, NULL TSRMLS_CC);
-			if (!loader) {
-				php_error_docref(NULL TSRMLS_CC, E_WARNING, "%s need to be initialize first", yaf_loader_ce->name);
-				RETURN_FALSE;
-			} else {
-				zval *library = zend_read_property(yaf_loader_ce, loader, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_LIBRARY), 1 TSRMLS_CC);
-				len = spprintf(&file, 0, "%s%c%s", Z_STRVAL_P(library), DEFAULT_SLASH, file);
-				need_free = 1;
-			}
-		}
-
-		retval = (zend_hash_exists(&EG(included_files), file, len + 1));
-		if (retval) {
-			if (need_free) {
-				efree(file);
-			}
-			RETURN_TRUE;
-		}
-
-		retval = yaf_loader_import(file, len, 0 TSRMLS_CC);
-		if (need_free) {
-			efree(file);
-		}
-
-		RETURN_BOOL(retval);
-	}
-}
-/* }}} */
-
-/** {{{ proto public Yaf_Loader::autoload($class_name)
-*/
-PHP_METHOD(yaf_loader, autoload) {
-	char *class_name, *origin_classname, *app_directory, *directory = NULL, *file_name = NULL;
-#ifdef YAF_HAVE_NAMESPACE
-	char *origin_lcname = NULL;
-#endif
-	uint separator_len, class_name_len, file_name_len = 0;
-
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &class_name, &class_name_len) == FAILURE) {
-		return;
-	}
-
-	separator_len = YAF_G(name_separator_len);
-	app_directory = YAF_G(directory);
-	origin_classname = class_name;
-
-	do {
-		if (!class_name_len) {
-			break;
-		}
-#ifdef YAF_HAVE_NAMESPACE
-		{
-			int pos = 0;
-			origin_lcname = estrndup(class_name, class_name_len);
-			class_name 	  = origin_lcname;
-			while (pos < class_name_len) {
-				if (*(class_name + pos) == '\\') {
-					*(class_name + pos) = '_';
-				}
-				pos += 1;
-			}
-		}
-#endif
-
-		if (strncmp(class_name, YAF_LOADER_RESERVERD, YAF_LOADER_LEN_RESERVERD) == 0) {
-			php_error_docref(NULL TSRMLS_CC, E_WARNING, "You should not use '%s' as class name prefix", YAF_LOADER_RESERVERD);
-		}
-
-		if (yaf_loader_is_category(class_name, class_name_len, YAF_LOADER_MODEL, YAF_LOADER_LEN_MODEL TSRMLS_CC)) {
-			/* this is a model class */
-			spprintf(&directory, 0, "%s/%s", app_directory, YAF_MODEL_DIRECTORY_NAME);
-			file_name_len = class_name_len - separator_len - YAF_LOADER_LEN_MODEL;
-
-			if (YAF_G(name_suffix)) {
-				file_name = estrndup(class_name, file_name_len);
-			} else {
-				file_name = estrdup(class_name + YAF_LOADER_LEN_MODEL + separator_len);
-			}
-
-			break;
-		}
-
-		if (yaf_loader_is_category(class_name, class_name_len, YAF_LOADER_PLUGIN, YAF_LOADER_LEN_PLUGIN TSRMLS_CC)) {
-			/* this is a plugin class */
-			spprintf(&directory, 0, "%s/%s", app_directory, YAF_PLUGIN_DIRECTORY_NAME);
-			file_name_len = class_name_len - separator_len - YAF_LOADER_LEN_PLUGIN;
-
-			if (YAF_G(name_suffix)) {
-				file_name = estrndup(class_name, file_name_len);
-			} else {
-				file_name = estrdup(class_name + YAF_LOADER_LEN_PLUGIN + separator_len);
-			}
-
-			break;
-		}
-
-		if (yaf_loader_is_category(class_name, class_name_len, YAF_LOADER_CONTROLLER, YAF_LOADER_LEN_CONTROLLER TSRMLS_CC)) {
-			/* this is a controller class */
-			spprintf(&directory, 0, "%s/%s", app_directory, YAF_CONTROLLER_DIRECTORY_NAME);
-			file_name_len = class_name_len - separator_len - YAF_LOADER_LEN_CONTROLLER;
-
-			if (YAF_G(name_suffix)) {
-				file_name = estrndup(class_name, file_name_len);
-			} else {
-				file_name = estrdup(class_name + YAF_LOADER_LEN_CONTROLLER + separator_len);
-			}
-
-			break;
-		}
-
-
-/* {{{ This only effects internally */
-		if (YAF_G(st_compatible) && (strncmp(class_name, YAF_LOADER_DAO, YAF_LOADER_LEN_DAO) == 0
-					|| strncmp(class_name, YAF_LOADER_SERVICE, YAF_LOADER_LEN_SERVICE) == 0)) {
-			/* this is a model class */
-			spprintf(&directory, 0, "%s/%s", app_directory, YAF_MODEL_DIRECTORY_NAME);
-		}
-/* }}} */
-
-		file_name_len = class_name_len;
-		file_name     = class_name;
-
-	} while(0);
-
-	if (!app_directory && directory) {
-		efree(directory);
-#ifdef YAF_HAVE_NAMESPACE
-		if (origin_lcname) {
-			efree(origin_lcname);
-		}
-#endif
-		if (file_name != class_name) {
-			efree(file_name);
-		}
-
-		php_error_docref(NULL TSRMLS_CC, E_WARNING,
-				"Couldn't load a framework MVC class without an %s initializing", yaf_application_ce->name);
-		RETURN_FALSE;
-	}
-
-	if (!YAF_G(use_spl_autoload)) {
-		/** directory might be NULL since we passed a NULL */
-		if (yaf_internal_autoload(file_name, file_name_len, &directory TSRMLS_CC)) {
-			char *lc_classname = zend_str_tolower_dup(origin_classname, class_name_len);
-			if (zend_hash_exists(EG(class_table), lc_classname, class_name_len + 1)) {
-#ifdef YAF_HAVE_NAMESPACE
-				if (origin_lcname) {
-					efree(origin_lcname);
-				}
-#endif
-				if (directory) {
-					efree(directory);
-				}
-
-				if (file_name != class_name) {
-					efree(file_name);
-				}
-
-				efree(lc_classname);
-				RETURN_TRUE;
-			} else {
-				efree(lc_classname);
-				php_error_docref(NULL TSRMLS_CC, E_STRICT, "Could not find class %s in %s", class_name, directory);
-			}
-		}  else {
-			php_error_docref(NULL TSRMLS_CC, E_WARNING, "Failed opening script %s: %s", directory, strerror(errno));
-		}
-
-#ifdef YAF_HAVE_NAMESPACE
-		if (origin_lcname) {
-			efree(origin_lcname);
-		}
-#endif
-		if (directory) {
-			efree(directory);
-		}
-		if (file_name != class_name) {
-			efree(file_name);
-		}
-		RETURN_TRUE;
-	} else {
-		char *lower_case_name = zend_str_tolower_dup(origin_classname, class_name_len);
-		if (yaf_internal_autoload(file_name, file_name_len, &directory TSRMLS_CC) &&
-				zend_hash_exists(EG(class_table), lower_case_name, class_name_len + 1)) {
-#ifdef YAF_HAVE_NAMESPACE
-			if (origin_lcname) {
-				efree(origin_lcname);
-			}
-#endif
-			if (directory) {
-				efree(directory);
-			}
-			if (file_name != class_name) {
-				efree(file_name);
-			}
-
-			efree(lower_case_name);
-			RETURN_TRUE;
-		}
-#ifdef YAF_HAVE_NAMESPACE
-		if (origin_lcname) {
-			efree(origin_lcname);
-		}
-#endif
-		if (directory) {
-			efree(directory);
-		}
-		if (file_name != class_name) {
-			efree(file_name);
-		}
-		efree(lower_case_name);
-		RETURN_FALSE;
+		RETURN_EMPTY_STRING();
 	}
 }
 /* }}} */
@@ -887,54 +929,52 @@ PHP_METHOD(yaf_loader, autoload) {
 /** {{{ proto public Yaf_Loader::getInstance($library = NULL, $global_library = NULL)
 */
 PHP_METHOD(yaf_loader, getInstance) {
-	char 		*library	= NULL;
-	char 		*global	 	= NULL;
-	int	 	library_len 	= 0;
-	int  		global_len	= 0;
-	yaf_loader_t 	*loader;
+	zend_string *library = NULL;
+	zend_string *global = NULL;
+	yaf_loader_t *loader;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|ss", &library, &library_len, &global, &global_len) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "|S!S!", &library, &global) == FAILURE) {
 		return;
-	} 
+	}
 
-	loader = yaf_loader_instance(NULL, library, global TSRMLS_CC);
-	if (loader)
+	if ((loader = yaf_loader_instance(NULL))) {
+		if (library) {
+			yaf_loader_set_library_path(Z_YAFLOADEROBJ_P(loader), library);
+		}
+		if (global) {
+			yaf_loader_set_global_library_path(Z_YAFLOADEROBJ_P(loader), global);
+		}
+		/* for back-compatible with changing of YAF_G(lowcase_path) ini_set */
+		yaf_loader_reset(Z_YAFLOADEROBJ_P(loader));
 		RETURN_ZVAL(loader, 1, 0);
+	}
 
 	RETURN_FALSE;
 }
 /* }}} */
 
-/** {{{ proto private Yaf_Loader::__desctruct(void)
+/** {{{ proto private Yaf_Loader::__construct(void)
 */
-PHP_METHOD(yaf_loader, __destruct) {
-}
-/* }}} */
-
-/** {{{ proto yaf_override_spl_autoload($class_name)
-*/
-PHP_FUNCTION(yaf_override_spl_autoload) {
-	php_error_docref(NULL TSRMLS_CC, E_WARNING, "%s is disabled by ap.use_spl_autoload", YAF_SPL_AUTOLOAD_REGISTER_NAME);
-	RETURN_BOOL(0);
+PHP_METHOD(yaf_loader, __construct) {
 }
 /* }}} */
 
 /** {{{ yaf_loader_methods
 */
 zend_function_entry yaf_loader_methods[] = {
-	PHP_ME(yaf_loader, __construct, 			yaf_loader_void_arginfo, 		ZEND_ACC_PRIVATE | ZEND_ACC_CTOR)
-	PHP_ME(yaf_loader, __clone,				NULL, 					ZEND_ACC_PRIVATE | ZEND_ACC_CLONE)
-	PHP_ME(yaf_loader, __sleep,				NULL, 					ZEND_ACC_PRIVATE)
-	PHP_ME(yaf_loader, __wakeup,				NULL, 					ZEND_ACC_PRIVATE)
-	PHP_ME(yaf_loader, autoload,				yaf_loader_autoloader_arginfo,  	ZEND_ACC_PUBLIC)
-	PHP_ME(yaf_loader, getInstance,				yaf_loader_getinstance_arginfo, 	ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-	PHP_ME(yaf_loader, registerLocalNamespace,		yaf_loader_regnamespace_arginfo, 	ZEND_ACC_PUBLIC)
-	PHP_ME(yaf_loader, getLocalNamespace,			yaf_loader_void_arginfo, 		ZEND_ACC_PUBLIC)
-	PHP_ME(yaf_loader, clearLocalNamespace,			yaf_loader_void_arginfo, 		ZEND_ACC_PUBLIC)
-	PHP_ME(yaf_loader, isLocalName,				yaf_loader_islocalname_arginfo, 	ZEND_ACC_PUBLIC)
-	PHP_ME(yaf_loader, import,				yaf_loader_import_arginfo,		ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-	PHP_ME(yaf_loader, setLibraryPath,			yaf_loader_setlib_arginfo,		ZEND_ACC_PUBLIC)
-	PHP_ME(yaf_loader, getLibraryPath,			yaf_loader_getlib_arginfo,		ZEND_ACC_PUBLIC)
+	PHP_ME(yaf_loader, __construct, yaf_loader_void_arginfo, ZEND_ACC_PRIVATE|ZEND_ACC_CTOR)
+	PHP_ME(yaf_loader, autoload, yaf_loader_autoloader_arginfo, ZEND_ACC_PUBLIC)
+	PHP_ME(yaf_loader, getInstance, yaf_loader_getinstance_arginfo, ZEND_ACC_PUBLIC|ZEND_ACC_STATIC)
+	PHP_ME(yaf_loader, registerLocalNamespace, yaf_loader_regnamespace_arginfo, ZEND_ACC_PUBLIC)
+	PHP_ME(yaf_loader, getLocalNamespace, yaf_loader_void_arginfo, ZEND_ACC_PUBLIC)
+	PHP_ME(yaf_loader, clearLocalNamespace, yaf_loader_void_arginfo, ZEND_ACC_PUBLIC)
+	PHP_ME(yaf_loader, isLocalName, yaf_loader_islocalname_arginfo, ZEND_ACC_PUBLIC)
+	PHP_ME(yaf_loader, getNamespacePath, yaf_loader_islocalname_arginfo, ZEND_ACC_PUBLIC)
+	PHP_ME(yaf_loader, import, yaf_loader_import_arginfo, ZEND_ACC_PUBLIC|ZEND_ACC_STATIC)
+	PHP_ME(yaf_loader, setLibraryPath, yaf_loader_setlib_arginfo, ZEND_ACC_PUBLIC)
+	PHP_ME(yaf_loader, getLibraryPath, yaf_loader_getlib_arginfo, ZEND_ACC_PUBLIC)
+	PHP_MALIAS(yaf_loader, registerNamespace, registerLocalNamespace, yaf_loader_regnamespace_arginfo, ZEND_ACC_PUBLIC)
+	PHP_MALIAS(yaf_loader, getNamespaces, getLocalNamespace, yaf_loader_void_arginfo, ZEND_ACC_PUBLIC)
 	{NULL, NULL, NULL}
 };
 /* }}} */
@@ -945,12 +985,16 @@ YAF_STARTUP_FUNCTION(loader) {
 	zend_class_entry ce;
 
 	YAF_INIT_CLASS_ENTRY(ce, "Yaf_Loader",  "Yaf\\Loader", yaf_loader_methods);
-	yaf_loader_ce = zend_register_internal_class_ex(&ce, NULL, NULL TSRMLS_CC);
-	yaf_loader_ce->ce_flags |= ZEND_ACC_FINAL_CLASS;
+	yaf_loader_ce = zend_register_internal_class_ex(&ce, NULL);
+	yaf_loader_ce->ce_flags |= ZEND_ACC_FINAL;
+	yaf_loader_ce->serialize = zend_class_serialize_deny;
+	yaf_loader_ce->unserialize = zend_class_unserialize_deny;
 
-	zend_declare_property_null(yaf_loader_ce, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_LIBRARY), 	 ZEND_ACC_PROTECTED TSRMLS_CC);
-	zend_declare_property_null(yaf_loader_ce, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_GLOBAL_LIB), ZEND_ACC_PROTECTED TSRMLS_CC);
-	zend_declare_property_null(yaf_loader_ce, ZEND_STRL(YAF_LOADER_PROPERTY_NAME_INSTANCE),	 ZEND_ACC_PROTECTED|ZEND_ACC_STATIC TSRMLS_CC);
+	memcpy(&yaf_loader_obj_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
+	yaf_loader_obj_handlers.clone_obj = NULL;
+	yaf_loader_obj_handlers.get_gc = NULL;
+	yaf_loader_obj_handlers.free_obj = yaf_loader_obj_free;
+	yaf_loader_obj_handlers.get_properties = yaf_loader_get_properties;
 
 	return SUCCESS;
 }

@@ -32,7 +32,11 @@ file_put_contents($tpl2, <<<HTML
 HTML
 );
 
-echo $view->render($tpl, array('tpl' => $tpl2));
+try {
+	echo $view->render($tpl, array('tpl' => $tpl2));
+} catch (Error $e) {
+	echo $e->getMessage();
+}
 ?>
 --CLEAN--
 <?php
@@ -41,4 +45,4 @@ require "build.inc";
 shutdown();
 ?>
 --EXPECTF--
-Parse error: syntax error, unexpected '{' in %sfoo2.phtml on line %d
+syntax error, unexpected '}'

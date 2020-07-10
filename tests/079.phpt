@@ -1,12 +1,11 @@
 --TEST--
-Invalid read in autoloading
+Autoloading the classes under library
 --SKIPIF--
-<?php
-if (!extension_loaded("yaf")) die("skip"); 
-?>
+<?php if (!extension_loaded("yaf")) print "skip"; ?>
 --INI--
+yaf.use_spl_autoload=0
+yaf.lowcase_path=0
 yaf.use_namespace=0
-yaf.library=
 --FILE--
 <?php 
 require "build.inc";
@@ -18,46 +17,34 @@ $config = array(
 	),
 );
 
-file_put_contents(APPLICATION_PATH . "/controllers/Index.php", <<<PHP
+file_put_contents(APPLICATION_PATH . "/Bootstrap.php", <<<PHP
 <?php
-   class IndexController extends Yaf_Controller_Abstract {
-         public function indexAction() {
-			exit(Test_Tool::get("a"));
-         }
+   class Bootstrap extends Yaf_Bootstrap_Abstract {
+       public function _initTest() {
+			Yaf_Loader::getInstance()->registerLocalNamespace("Test");
+			Yaf_Registry::set("test", new Test());
+       }
    }
 PHP
 );
 
-file_put_contents(APPLICATION_PATH . "/library/Test/Tool.php", <<<PHP
+file_put_contents(APPLICATION_PATH . "/library/Test.php", <<<PHP
 <?php
-   class Test_Tool {
-         public static function get(\$name) {
-		 	\$a = Test_Dict::dummy();
-			/* tigger this_var is generated */
-			return \$\$name;
-         }
-   }
-PHP
-);
-
-file_put_contents(APPLICATION_PATH . "/library/Test/Dict.php", <<<PHP
-<?php
-   class Test_Dict {
-         public static function dummy() {
-		 	return "okey";
-         }
-   }
+class Test {
+	public function __construct() {
+		var_dump("okey");
+	}
+}
 PHP
 );
 
 $app = new Yaf_Application($config);
-$request = new Yaf_Request_Simple();
-$app->getDispatcher()->dispatch($request);
+$response = $app->bootstrap();
 ?>
 --CLEAN--
 <?php
 require "build.inc"; 
 shutdown();
 ?>
---EXPECT--
-okey
+--EXPECTF--
+string(4) "okey"

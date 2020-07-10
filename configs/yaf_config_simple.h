@@ -14,13 +14,12 @@
   +----------------------------------------------------------------------+
 */
 
-
 #ifndef YAF_CONFIG_SIMPLE_H
 #define YAF_CONFIG_SIMPLE_H
 
 extern zend_class_entry *yaf_config_simple_ce;
 
-yaf_config_t * yaf_config_simple_instance(yaf_config_t *this_ptr, zval *values, zval *readonly TSRMLS_DC);
+void yaf_config_simple_init(yaf_config_object *conf, zval *values, int readonly);
 
 YAF_STARTUP_FUNCTION(config_simple);
 

@@ -1,7 +1,7 @@
 <?php
 define('DIR_ROOT', dirname(__FILE__));
 
-define("APPLICATION_PATH", DIR_ROOT . '/application');
+define("APPLICATION_PATH", DIR_ROOT . DIRECTORY_SEPARATOR . 'application');
 
 function shutdown($root = APPLICATION_PATH) {
     $dp = opendir($root);
@@ -22,15 +22,14 @@ function shutdown($root = APPLICATION_PATH) {
 
 function startup($root = APPLICATION_PATH) {
     $dirs = array();
+    $dirs[] = 'library';
     $dirs[] = 'controllers';
-    $dirs[] = 'actions';
+	$dirs[] = 'actions';
     $dirs[] = 'plugins';
     $dirs[] = 'models';
     $dirs[] = 'views';
     $dirs[] = 'views/index';
     $dirs[] = 'tpls';
-    $dirs[] = 'library';
-    $dirs[] = 'library/Test';
 
     foreach($dirs as $dir){
         $dir = $root . DIRECTORY_SEPARATOR . $dir;

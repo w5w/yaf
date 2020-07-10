@@ -14,13 +14,13 @@
   +----------------------------------------------------------------------+
 */
 
-
 #ifndef YAF_ROUTER_STATIC_H
 #define YAF_ROUTER_STATIC_H
 
 extern zend_class_entry *yaf_route_static_ce;
 
-int yaf_route_pathinfo_route(yaf_request_t *request, char *req_uri, int req_uri_len TSRMLS_DC);
+void yaf_route_pathinfo_route(yaf_request_object *request, const char *req_uri, size_t req_uri_len);
+void yaf_route_static_route(yaf_route_t *route, yaf_request_t *req);
 
 YAF_STARTUP_FUNCTION(route_static);
 

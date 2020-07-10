@@ -11,14 +11,13 @@ $request = new Yaf_Request_Http("/subdir/ctl/act/name/value");
 $router = new Yaf_Router();
 
 $route  = new Yaf_Route_Regex(
-	"#subdir/(.*?)/(.*?)/.*#",
+	"#subdir/(?<c>.*?)/(.*?)/.*#",
 	array(
         "module" => "m",
         "controller" => ":c",
 		"action" => ":a",
 	),
     array(
-        1 => "c",
         2 => "a",
     )
 );
@@ -58,13 +57,13 @@ Array
     [a] => act
 )
 string(3) "act"
-string(3) "ctl"
-string(1) "m"
+string(3) "Ctl"
+string(1) "M"
 string(3) "yaf"
 Array
 (
     [action] => act
 )
 string(3) "act"
-string(5) "index"
+string(5) "Index"
 NULL
